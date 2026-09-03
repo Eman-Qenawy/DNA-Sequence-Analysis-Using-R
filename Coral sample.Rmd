@@ -1,0 +1,230 @@
+---
+title: "Metagenomics analysis"
+author: "Eman Mamdouh Qenawy"
+date: "8/2026"
+output: html_document
+---
+
+```{r}
+# ============================================================
+#  DADA2 Pipeline - Full 16S rRNA Amplicon Workflow
+#  Designed for RStudio | eman mamdouh
+#  Input: Paired-end FASTQ files from Mothur pre-processing
+# ============================================================
+
+# ── 0. Install / Load Packages ─────────────────────────────
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+# BiocManager::install("dada2")       # Uncomment first run
+# BiocManager::install("phyloseq")    # Uncomment first run
+# install.packages("ggplot2")         # Uncomment first run
+BiocManager::install("SRAdb")
+library(dada2)
+library(phyloseq)
+library(ggplot2)
+library(SRAdb)
+packageVersion("dada2")   # Confirm version (≥1.26 recommended)
+
+# ── 1. Set Paths ───────────────────────────────────────────
+path <- "/Users/pc/Desktop/New folder (3)/70_ Coral Sampls/"
+# List files to confirm they are visible
+list.files(path)
+
+#url_R1 <- "https://ebi.ac.uk"
+#url_R2 <- "https://ebi.ac.uk"
+
+#download.file(url_R1, destfile = paste0(path, "SRR8470289_R1.fastq.gz"), mode = "wb")
+#download.file(url_R2, destfile = paste0(path, "SRR8470289_R2.fastq.gz"), mode = "wb")
+
+
+# ── 2. Sort and Match Forward & Reverse Reads ──────────────
+# Adjust pattern to match your file naming convention:
+# Common patterns: *_R1_001.fastq.gz  |  *_R1.fastq.gz  |  *_1.fastq
+fnFs <- sort(list.files(path, pattern = "forward", full.names = TRUE, recursive = TRUE))
+fnRs <- sort(list.files(path, pattern = "reverse", full.names = TRUE, recursive = TRUE))
+
+# Extract sample names (strip path + suffix)
+#sample.names <- sub("forward.fastqsanger", "", basename(fnFs))
+#sample.names
+
+sample.names <- basename(dirname(fnFs))
+sample.names
+
+# Sanity check: forward and reverse files must match in number
+stopifnot(length(fnFs) == length(fnRs))
+
+# ── 3. Visualize Quality Profiles ──────────────────────────
+# Plot first 2 samples — inspect before choosing truncLen values
+plotQualityProfile(fnFs[1:2])   # Forward reads
+plotQualityProfile(fnRs[1:2])   # Reverse reads
+
+# ── 4. Filter and Trim ─────────────────────────────────────
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+# ▸ Adjust truncLen based on quality plots above
+# ▸ For V3-V4 region (Illumina 2×250): truncLen=c(250,200) is typical
+# ▸ For V4 region (Illumina 2×150): truncLen=c(150,130) is typical
+out <- filterAndTrim(
+  fnFs, filtFs,
+  fnRs, filtRs,
+  truncLen    = c(240, 200),   # ← ADJUST based on quality plots
+  maxN        = 0,             # No Ns allowed in DADA2
+  maxEE       = c(2, 2),       # Max expected errors per read
+  truncQ      = 2,
+  rm.phix     = TRUE,
+  compress    = TRUE,
+  multithread = TRUE           # Set FALSE on Windows
+)
+
+print(out)  # Check reads passing filter (aim for >70% retention)
+
+# Remove samples with zero reads after filtering
+filtFs <- filtFs[file.exists(filtFs)]
+filtRs <- filtRs[file.exists(filtRs)]
+sample.names <- names(filtFs)
+
+# ── 5. Learn Error Rates ────────────────────────────────────
+set.seed(100)
+errF <- learnErrors(filtFs, multithread = TRUE)
+errR <- learnErrors(filtRs, multithread = TRUE)
+
+# Visualize error rates — modeled (black line) should fit observed (points)
+plotErrors(errF, nominalQ = TRUE)
+plotErrors(errR, nominalQ = TRUE)
+
+# ── 6. Dereplicate Reads ────────────────────────────────────
+derepFs <- derepFastq(filtFs)
+derepRs <- derepFastq(filtRs)
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+
+# ── 7. Sample Inference (DADA2 Core) ───────────────────────
+dadaFs <- dada(derepFs, err = errF, multithread = TRUE, pool = "pseudo")
+dadaRs <- dada(derepRs, err = errR, multithread = TRUE, pool = "pseudo")
+
+# Inspect one sample
+dadaFs[[1]]
+
+# ── 8. Merge Paired Reads ───────────────────────────────────
+mergers <- mergePairs(
+  dadaFs, derepFs,
+  dadaRs, derepRs,
+  minOverlap  = 12,    # Minimum overlap between F and R reads
+  maxMismatch = 0,     # No mismatches in overlap region
+  verbose     = TRUE
+)
+
+# Inspect merger result for first sample
+head(mergers[[1]])
+
+# ── 9. Build Sequence Table (ASV Table) ─────────────────────
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)  # rows = samples, columns = ASVs
+
+# Inspect length distribution of merged sequences
+table(nchar(getSequences(seqtab)))
+# ▸ For V1-V2: expected amplicon ~330-350 bp
+
+
+# ── 10. Remove Chimeras ─────────────────────────────────────
+seqtab.nochim <- removeBimeraDenovo(
+  seqtab,
+  method      = "consensus",
+  multithread = TRUE,
+  verbose     = TRUE
+)
+
+dim(seqtab.nochim)
+
+# Fraction of reads retained after chimera removal (should be >80%)
+cat("Fraction of reads retained:", sum(seqtab.nochim) / sum(seqtab), "\n")
+
+# ── 11. Track Reads Through Pipeline ───────────────────────
+getN <- function(x) sum(getUniques(x))
+
+track <- cbind(
+  out[rownames(out) %in% paste0(sample.names, ".fastqsanger"), ],
+  sapply(dadaFs,  getN),
+  sapply(dadaRs,  getN),
+  sapply(mergers, getN),
+  rowSums(seqtab.nochim)
+)
+
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+print(track)
+
+# Save tracking table
+write.csv(as.data.frame(track),
+          file = file.path(path, "read_tracking.csv"))
+
+# ── 12. Assign Taxonomy ─────────────────────────────────────
+# Download Silva database from: https://zenodo.org/record/4587955
+# Files needed:
+#   silva_nr99_v138.1_train_set.fa.gz       (genus level)
+#   silva_species_assignment_v138.1.fa.gz   (species level)
+
+taxa.db  <- "/Users/pc/Desktop/bio course/Metagenomic/project fils/silva_nr99_v138.1_train_set.fa.gz"       # ← UPDATE path
+species.db <- "/Users/pc/Desktop/bio course/Metagenomic/project fils/silva_species_assignment_v138.1.fa.gz" # ← UPDATE path
+
+taxa <- assignTaxonomy(seqtab.nochim, taxa.db, multithread = TRUE)
+taxa <- addSpecies(taxa, species.db)
+
+# Preview taxonomy table
+taxa.print <- taxa
+rownames(taxa.print) <- NULL
+head(taxa.print)
+
+# ── 13. Build Phyloseq Object ───────────────────────────────
+# Optional: load metadata table (samples × variables)
+# metadata <- read.csv(file.path(path, "metadata.csv"), row.names = 1)
+
+ps <- phyloseq(
+  otu_table(seqtab.nochim, taxa_are_rows = FALSE),
+  # sample_data(metadata),    # Uncomment if metadata is ready
+  tax_table(taxa)
+)
+
+ps   # Print summary
+
+# Rename ASVs to short IDs (ASV1, ASV2, ...) for readability
+dna <- Biostrings::DNAStringSet(taxa_names(ps))
+names(dna) <- paste0("ASV", seq_along(dna))
+ps  <- merge_phyloseq(ps, dna)
+taxa_names(ps) <- paste0("ASV", seq_along(taxa_names(ps)))
+ps
+
+# ── 14. Save Outputs ───────────────────────────────────────
+saveRDS(seqtab.nochim,
+        file.path(path, "seqtab_nochim.rds"))
+saveRDS(taxa,
+        file.path(path, "taxonomy.rds"))
+saveRDS(ps,
+        file.path(path, "phyloseq_object.rds"))
+
+write.csv(as.data.frame(seqtab.nochim),
+          file.path(path, "ASV_table.csv"))
+write.csv(as.data.frame(taxa),
+          file.path(path, "taxonomy_table.csv"))
+
+#cat("\n✅ DADA2 pipeline complete! Outputs saved to:",)
+path =("/Users/pc/Desktop/New folder (3)/")
+
+
+# ── 15. Quick Diversity Visualization (Optional) ────────────
+# Alpha diversity
+plot_richness(ps, measures = c("Shannon", "Simpson")) +
+  theme_bw() +
+  ggtitle("Alpha Diversity")
+
+# Ordination (Bray-Curtis)
+ord <- ordinate(ps, method = "PCoA", distance = "bray")
+plot_ordination(ps, ord, type = "samples") +
+  geom_point(size = 3) +
+  theme_bw() +
+  ggtitle("Beta Diversity - PCoA (Bray-Curtis)")
+```
+
